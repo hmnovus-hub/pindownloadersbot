@@ -209,7 +209,9 @@ def _download_with_ytdlp(url: str, directory: Path, max_bytes: int) -> Downloade
     media_type = _media_type_for_file(path, info)
     if path.stat().st_size > max_bytes:
         raise PinterestDownloadError("Файл слишком большой для отправки в Telegram.")
-    return DownloadedMedia(path=path, media_type=media_type, title=(info or {}).get("title"))
+    metadata = info or {}
+    description = metadata.get("description") or metadata.get("title")
+    return DownloadedMedia(path=path, media_type=media_type, title=description)
 
 
 async def _metadata_fallback(
@@ -252,7 +254,11 @@ async def _metadata_fallback(
                 video_url = _best_video_url(pin_data)
                 if video_url and _is_pinimg_url(video_url):
                     await _reject_private_dns(video_url)
-                    title = pin_data.get("title") or pin_data.get("grid_title")
+                    title = (
+                        pin_data.get("description")
+                        or pin_data.get("title")
+                        or pin_data.get("grid_title")
+                    )
                     return await asyncio.to_thread(
                         _download_video_url,
                         video_url,

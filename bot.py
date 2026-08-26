@@ -4,12 +4,23 @@ import asyncio
 import logging
 import os
 import secrets
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+)
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
 
@@ -38,6 +49,93 @@ instagram_downloader: InstagramDownloader
 snapchat_downloader: SnapchatDownloader
 download_slots: asyncio.Semaphore
 stats_store: StatsStore
+DESCRIPTION_TTL_SECONDS = 24 * 60 * 60
+DESCRIPTION_CACHE_LIMIT = 2000
+
+
+@dataclass(frozen=True)
+class DescriptionEntry:
+    chat_id: int
+    message_id: int
+    owner_id: int
+    base_caption: str
+    description: str
+    created_at: float
+
+
+description_cache: dict[str, DescriptionEntry] = {}
+
+
+def _clean_description(description: str | None) -> str | None:
+    if not isinstance(description, str):
+        return None
+    cleaned = description.strip()
+    return cleaned or None
+
+
+def _truncate_utf16(text: str, max_units: int) -> str:
+    encoded = text.encode("utf-16-le")
+    if len(encoded) // 2 <= max_units:
+        return text
+    return encoded[: max_units * 2].decode("utf-16-le", errors="ignore").rstrip()
+
+
+def _description_caption(base_caption: str, description: str) -> str:
+    prefix = f"{base_caption}\n\n"
+    prefix_units = len(prefix.encode("utf-16-le")) // 2
+    available = 1024 - prefix_units
+    description_units = len(description.encode("utf-16-le")) // 2
+    if description_units > available:
+        description = _truncate_utf16(description, max(available - 1, 0)) + "…"
+    return prefix + description
+
+
+def _description_button(description: str | None) -> tuple[str | None, InlineKeyboardMarkup | None]:
+    if not _clean_description(description):
+        return None, None
+    token = secrets.token_hex(12)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="📝 Показать описание",
+                callback_data=f"description:{token}",
+            )
+        ]]
+    )
+    return token, keyboard
+
+
+def _remember_description(
+    token: str | None,
+    sent_message: Message,
+    owner_id: int,
+    base_caption: str,
+    description: str | None,
+) -> None:
+    cleaned = _clean_description(description)
+    if not token or not cleaned:
+        return
+
+    now = time.monotonic()
+    expired = [
+        key
+        for key, entry in description_cache.items()
+        if now - entry.created_at > DESCRIPTION_TTL_SECONDS
+    ]
+    for key in expired:
+        description_cache.pop(key, None)
+    while len(description_cache) >= DESCRIPTION_CACHE_LIMIT:
+        oldest = next(iter(description_cache))
+        description_cache.pop(oldest, None)
+
+    description_cache[token] = DescriptionEntry(
+        chat_id=sent_message.chat.id,
+        message_id=sent_message.message_id,
+        owner_id=owner_id,
+        base_caption=base_caption,
+        description=cleaned,
+        created_at=now,
+    )
 
 
 def user_id_for(message: Message) -> int:
@@ -99,15 +197,35 @@ async def stats_message(message: Message) -> None:
 
 async def send_instagram_media(message: Message, media_items: list) -> None:
     caption = "Скачано из Instagram"
+    description = next(
+        (item.description for item in media_items if item.description),
+        None,
+    )
+    owner_id = user_id_for(message)
     for start_index in range(0, len(media_items), 10):
         chunk = media_items[start_index : start_index + 10]
+        token, keyboard = (
+            _description_button(description)
+            if start_index == 0
+            else (None, None)
+        )
         if len(chunk) == 1:
             item = chunk[0]
             upload = FSInputFile(item.path)
             if item.media_type == "video":
-                await message.answer_video(upload, caption=caption, supports_streaming=True)
+                sent = await message.answer_video(
+                    upload,
+                    caption=caption,
+                    supports_streaming=True,
+                    reply_markup=keyboard,
+                )
             else:
-                await message.answer_photo(upload, caption=caption)
+                sent = await message.answer_photo(
+                    upload,
+                    caption=caption,
+                    reply_markup=keyboard,
+                )
+            _remember_description(token, sent, owner_id, caption, description)
             continue
 
         group = []
@@ -118,7 +236,49 @@ async def send_instagram_media(message: Message, media_items: list) -> None:
                 group.append(InputMediaVideo(media=upload, caption=item_caption, supports_streaming=True))
             else:
                 group.append(InputMediaPhoto(media=upload, caption=item_caption))
-        await message.answer_media_group(group)
+        sent_group = await message.answer_media_group(group)
+        if keyboard and sent_group:
+            first = sent_group[0]
+            try:
+                await message.bot.edit_message_reply_markup(
+                    chat_id=first.chat.id,
+                    message_id=first.message_id,
+                    reply_markup=keyboard,
+                )
+                _remember_description(token, first, owner_id, caption, description)
+            except TelegramBadRequest:
+                logging.exception("Telegram rejected a description button for media group")
+
+
+@router.callback_query(F.data.startswith("description:"))
+async def show_description(callback: CallbackQuery) -> None:
+    token = (callback.data or "").partition(":")[2]
+    entry = description_cache.get(token)
+    if not entry or time.monotonic() - entry.created_at > DESCRIPTION_TTL_SECONDS:
+        description_cache.pop(token, None)
+        await callback.answer(
+            "Описание больше недоступно. Пришли ссылку ещё раз.",
+            show_alert=True,
+        )
+        return
+    if callback.from_user.id != entry.owner_id:
+        await callback.answer("Эта кнопка предназначена автору запроса.", show_alert=True)
+        return
+
+    try:
+        await callback.bot.edit_message_caption(
+            chat_id=entry.chat_id,
+            message_id=entry.message_id,
+            caption=_description_caption(entry.base_caption, entry.description),
+            reply_markup=None,
+        )
+    except TelegramBadRequest:
+        logging.exception("Failed to add media description")
+        await callback.answer("Не получилось добавить описание.", show_alert=True)
+        return
+
+    description_cache.pop(token, None)
+    await callback.answer("Описание добавлено")
 
 
 @router.message(F.text)
@@ -147,23 +307,54 @@ async def handle_link(message: Message) -> None:
                     media = await asyncio.to_thread(
                         snapchat_downloader.download, snapchat_url, Path(temp_dir)
                     )
-                    await message.answer_video(
+                    caption = "Скачано из Snapchat"
+                    token, keyboard = _description_button(media.description)
+                    sent = await message.answer_video(
                         FSInputFile(media.path),
-                        caption="Скачано из Snapchat",
+                        caption=caption,
                         supports_streaming=True,
+                        reply_markup=keyboard,
+                    )
+                    _remember_description(
+                        token,
+                        sent,
+                        user_id_for(message),
+                        caption,
+                        media.description,
                     )
                     media_count = 1
                 else:
                     media = await downloader.download(pinterest_url, Path(temp_dir))
                     upload = FSInputFile(media.path)
                     caption = "Скачано с Pinterest"
+                    token, keyboard = _description_button(media.title)
                     if media.media_type == "video":
-                        await message.answer_video(upload, caption=caption, supports_streaming=True)
+                        sent = await message.answer_video(
+                            upload,
+                            caption=caption,
+                            supports_streaming=True,
+                            reply_markup=keyboard,
+                        )
                     else:
                         try:
-                            await message.answer_photo(upload, caption=caption)
+                            sent = await message.answer_photo(
+                                upload,
+                                caption=caption,
+                                reply_markup=keyboard,
+                            )
                         except Exception:
-                            await message.answer_document(FSInputFile(media.path), caption=caption)
+                            sent = await message.answer_document(
+                                FSInputFile(media.path),
+                                caption=caption,
+                                reply_markup=keyboard,
+                            )
+                    _remember_description(
+                        token,
+                        sent,
+                        user_id_for(message),
+                        caption,
+                        media.title,
+                    )
                     media_count = 1
         await record_stats(message, platform, True, media_count)
         await status.delete()

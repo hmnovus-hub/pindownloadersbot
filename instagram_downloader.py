@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -32,6 +33,21 @@ class InstagramDownloadError(RuntimeError):
 class InstagramMedia:
     path: Path
     media_type: str
+    description: str | None = None
+
+
+def _read_description(directory: Path) -> str | None:
+    for metadata_path in sorted(directory.rglob("*.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        description = metadata.get("description")
+        if isinstance(description, str) and description.strip():
+            return description.strip()
+    return None
 
 
 def _normalized_host(url: str) -> str:
@@ -85,12 +101,14 @@ class InstagramDownloader:
             "extractor.instagram.videos=merged",
             "--option",
             "extractor.instagram.order-files=asc",
+            "--write-metadata",
         ]
         if self.cookies_file:
             cookie_path = Path(os.path.expandvars(os.path.expanduser(self.cookies_file)))
             if not cookie_path.is_file():
                 raise InstagramDownloadError(
-                    "Файл Instagram cookies не найден. Проверь INSTAGRAM_COOKIES_FILE в .env."
+                    "Файл Instagram cookies не найден. Проверь переменную "
+                    "INSTAGRAM_COOKIES_FILE."
                 )
             command.extend(["--cookies", str(cookie_path)])
         elif self.cookies_from_browser == "comet":
@@ -188,7 +206,12 @@ class InstagramDownloader:
                 "Не удалось получить публикацию. Возможно, она закрытая, удалена или требует входа."
             )
 
+        description = _read_description(directory)
         return [
-            InstagramMedia(path=path, media_type=MEDIA_EXTENSIONS[path.suffix.lower()])
+            InstagramMedia(
+                path=path,
+                media_type=MEDIA_EXTENSIONS[path.suffix.lower()],
+                description=description,
+            )
             for path in files
         ]

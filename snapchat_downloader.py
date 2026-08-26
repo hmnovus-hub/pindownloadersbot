@@ -34,6 +34,7 @@ class _QuietLogger:
 class SnapchatMedia:
     path: Path
     media_type: str = "video"
+    description: str | None = None
 
 
 def is_snapchat_url(url: str) -> bool:
@@ -73,7 +74,7 @@ class SnapchatDownloader:
         }
         try:
             with YoutubeDL(options) as ydl:
-                ydl.extract_info(url, download=True)
+                info = ydl.extract_info(url, download=True)
         except DownloadError as exc:
             raise SnapchatDownloadError(
                 "Не удалось скачать Spotlight. Возможно, он удалён или недоступен."
@@ -84,4 +85,10 @@ class SnapchatDownloader:
         path = max(files, key=lambda item: item.stat().st_mtime)
         if path.stat().st_size > self.max_bytes:
             raise SnapchatDownloadError("Видео слишком большое для отправки в Telegram.")
-        return SnapchatMedia(path=path)
+        metadata = info if isinstance(info, dict) else {}
+        description = metadata.get("description") or metadata.get("title")
+        if isinstance(description, str):
+            description = description.strip() or None
+        else:
+            description = None
+        return SnapchatMedia(path=path, description=description)
