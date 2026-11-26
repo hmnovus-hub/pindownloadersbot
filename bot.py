@@ -24,6 +24,7 @@ from aiogram.types import (
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
 
+from countdown import Countdown
 from downloader import (
     PinterestDownloadError,
     PinterestDownloader,
@@ -49,6 +50,7 @@ instagram_downloader: InstagramDownloader
 snapchat_downloader: SnapchatDownloader
 download_slots: asyncio.Semaphore
 stats_store: StatsStore
+countdown: Countdown | None = None
 DESCRIPTION_TTL_SECONDS = 24 * 60 * 60
 DESCRIPTION_CACHE_LIMIT = 2000
 
@@ -281,6 +283,12 @@ async def show_description(callback: CallbackQuery) -> None:
     await callback.answer("Описание добавлено")
 
 
+@router.message(Command("video"))
+async def countdown_video(message: Message) -> None:
+    if countdown is not None:
+        await countdown.preview(message)
+
+
 @router.message(F.text)
 async def handle_link(message: Message) -> None:
     pinterest_url = find_pinterest_url(message.text or "")
@@ -380,6 +388,7 @@ async def health(_: web.Request) -> web.Response:
 
 def main() -> None:
     global downloader, instagram_downloader, snapchat_downloader, download_slots, stats_store
+    global countdown
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -398,6 +407,7 @@ def main() -> None:
     download_slots = asyncio.Semaphore(concurrency)
 
     bot = Bot(token=token)
+    countdown = Countdown.from_env(bot)
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
 
@@ -429,6 +439,8 @@ def main() -> None:
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    if countdown is not None:
+        app.router.add_post("/daily", countdown.daily)
     SimpleRequestHandler(
         dispatcher=dispatcher,
         bot=bot,
