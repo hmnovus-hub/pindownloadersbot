@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import secrets
@@ -50,7 +51,6 @@ instagram_downloader: InstagramDownloader
 snapchat_downloader: SnapchatDownloader
 download_slots: asyncio.Semaphore
 stats_store: StatsStore
-countdown: Countdown | None = None
 DESCRIPTION_TTL_SECONDS = 24 * 60 * 60
 DESCRIPTION_CACHE_LIMIT = 2000
 
@@ -283,12 +283,6 @@ async def show_description(callback: CallbackQuery) -> None:
     await callback.answer("Описание добавлено")
 
 
-@router.message(Command("video"))
-async def countdown_video(message: Message) -> None:
-    if countdown is not None:
-        await countdown.preview(message)
-
-
 @router.message(F.text)
 async def handle_link(message: Message) -> None:
     pinterest_url = find_pinterest_url(message.text or "")
@@ -386,9 +380,32 @@ async def health(_: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+def configure_countdown(app: web.Application, downloader_token: str) -> None:
+    token = os.getenv("COUNTDOWN_BOT_TOKEN")
+    if not token or token == downloader_token:
+        logging.warning("A dedicated countdown bot token is required")
+        return
+    bot = Bot(token=token)
+    countdown = Countdown.from_env(bot)
+    if countdown is None:
+        app.on_cleanup.append(lambda app: bot.session.close())
+        return
+
+    dispatcher = Dispatcher()
+    dispatcher.message.register(countdown.preview, Command("video", "start"))
+    webhook_secret = hmac.digest(token.encode(), b"countdown-webhook-v1", "sha256").hex()
+    app.router.add_post("/daily", countdown.daily)
+    SimpleRequestHandler(
+        dispatcher=dispatcher,
+        bot=bot,
+        handle_in_background=True,
+        secret_token=webhook_secret,
+    ).register(app, path="/telegram/countdown")
+    setup_application(app, dispatcher, bot=bot)
+
+
 def main() -> None:
     global downloader, instagram_downloader, snapchat_downloader, download_slots, stats_store
-    global countdown
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -407,7 +424,6 @@ def main() -> None:
     download_slots = asyncio.Semaphore(concurrency)
 
     bot = Bot(token=token)
-    countdown = Countdown.from_env(bot)
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
 
@@ -439,8 +455,7 @@ def main() -> None:
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
-    if countdown is not None:
-        app.router.add_post("/daily", countdown.daily)
+    configure_countdown(app, token)
     SimpleRequestHandler(
         dispatcher=dispatcher,
         bot=bot,
